@@ -275,7 +275,10 @@ func TestBuildSubDAGRunsAddressesPreviousAttemptRuns(t *testing.T) {
 	require.Equal(t, firstAttempt, buildIDs(t, retried))
 }
 
-func TestBuildChildRunParams_SelectorConflict(t *testing.T) {
+// Routing each item to its own worker is the point of an item-scoped worker
+// selector, so items that share explicit params must still become separate
+// child runs rather than colliding on the selector they differ by.
+func TestBuildChildRunParams_ItemScopedSelectorFansOut(t *testing.T) {
 	t.Parallel()
 
 	subDAG := &ir.SubDAG{Name: "child", Params: "MODE=batch"}
@@ -291,9 +294,15 @@ func TestBuildChildRunParams_SelectorConflict(t *testing.T) {
 	ctx := NewContextForTest(context.Background(), dag, "root-run", "")
 	ctx = WithEnv(ctx, NewEnv(ctx, step))
 
-	_, err := NewNode(step, NodeState{}).buildChildRunParams(ctx, subDAG)
-	require.ErrorContains(t, err, "same sub-DAG run")
-	require.ErrorContains(t, err, "different worker selectors")
+	runs, err := NewNode(step, NodeState{}).buildChildRunParams(ctx, subDAG)
+	require.NoError(t, err)
+	require.Len(t, runs, 2)
+
+	require.Equal(t, "serverA", runs[0].ParallelItem)
+	require.Equal(t, map[string]string{"host": "serverA"}, runs[0].WorkerSelector)
+	require.Equal(t, "serverB", runs[1].ParallelItem)
+	require.Equal(t, map[string]string{"host": "serverB"}, runs[1].WorkerSelector)
+	require.NotEqual(t, runs[0].RunID, runs[1].RunID)
 }
 
 func TestBuildChildRunParams_PreservesItemsWithSharedExplicitParams(t *testing.T) {
@@ -314,12 +323,46 @@ func TestBuildChildRunParams_PreservesItemsWithSharedExplicitParams(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, runs, 2)
 
-	items := []string{runs[0].ParallelItem, runs[1].ParallelItem}
-	sort.Strings(items)
-	require.Equal(t, []string{"one", "two"}, items)
+	require.Equal(t, "one", runs[0].ParallelItem)
+	require.Equal(t, "two", runs[1].ParallelItem)
 	require.Equal(t, "MODE=batch", runs[0].Params)
 	require.Equal(t, "MODE=batch", runs[1].Params)
 	require.NotEqual(t, runs[0].RunID, runs[1].RunID)
+}
+
+// Child runs must follow parallel.items order, and a duplicate item must keep
+// the position of its first occurrence. The build is repeated because the
+// defect this guards against was a Go map range, which only reorders on some
+// iterations.
+func TestBuildChildRunParams_PreservesItemOrder(t *testing.T) {
+	t.Parallel()
+
+	subDAG := &ir.SubDAG{Name: "child"}
+	step := ir.Step{
+		Name:   "run-child",
+		SubDAG: subDAG,
+		Parallel: &ir.ParallelConfig{
+			Items: []ir.ParallelItem{
+				{Value: "alpha"},
+				{Value: "beta"},
+				{Value: "alpha"},
+				{Value: "gamma"},
+			},
+		},
+	}
+	ctx := NewContextForTest(context.Background(), &ir.DAG{Name: "root", Steps: []ir.Step{step}}, "root-run", "")
+	ctx = WithEnv(ctx, NewEnv(ctx, step))
+
+	for range 10 {
+		runs, err := NewNode(step, NodeState{}).buildChildRunParams(ctx, subDAG)
+		require.NoError(t, err)
+
+		got := make([]string, 0, len(runs))
+		for _, run := range runs {
+			got = append(got, run.Params)
+		}
+		require.Equal(t, []string{"alpha", "beta", "gamma"}, got)
+	}
 }
 
 // TestSetupExecutor_HarnessCommandPreservesLiteralCodeFences verifies that
