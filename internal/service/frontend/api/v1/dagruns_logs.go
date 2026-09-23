@@ -97,6 +97,42 @@ func (r *stepLogArchiveResponse) writeArchive(w io.Writer) error {
 	return archive.Close()
 }
 
+// logFileResponse streams one log file as a text attachment and closes it afterwards.
+type logFileResponse struct {
+	ctx      context.Context
+	reader   io.ReadCloser
+	filename string
+}
+
+func (r *logFileResponse) VisitDownloadDAGRunLogResponse(w http.ResponseWriter) error {
+	return r.writeTo(w)
+}
+
+func (r *logFileResponse) VisitDownloadDAGRunStepLogResponse(w http.ResponseWriter) error {
+	return r.writeTo(w)
+}
+
+func (r *logFileResponse) VisitDownloadSubDAGRunLogResponse(w http.ResponseWriter) error {
+	return r.writeTo(w)
+}
+
+func (r *logFileResponse) VisitDownloadSubDAGRunStepLogResponse(w http.ResponseWriter) error {
+	return r.writeTo(w)
+}
+
+func (r *logFileResponse) writeTo(w http.ResponseWriter) error {
+	defer func() { _ = r.reader.Close() }()
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", r.filename))
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, r.reader); err != nil {
+		logger.Error(r.ctx, "Failed to stream log download", tag.Error(err))
+		// Headers are committed; abort so clients cannot mistake a partial log for a complete one.
+		panic(http.ErrAbortHandler)
+	}
+	return nil
+}
+
 func isStepLogDownload(r *http.Request, apiBasePath string) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		return false
@@ -110,12 +146,21 @@ func isStepLogDownload(r *http.Request, apiBasePath string) bool {
 		(len(parts) == 7 && parts[2] == "sub-dag-runs" && strings.Join(parts[4:], "/") == "steps/log/download")
 }
 
-func stepLogDownloadDeadline(apiBasePath string) func(http.Handler) http.Handler {
+// isLogDownload matches scheduler, step, and all-step log downloads.
+func isLogDownload(r *http.Request, apiBasePath string) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		return false
+	}
+	suffix, ok := strings.CutPrefix(r.URL.Path, strings.TrimRight(apiBasePath, "/")+"/dag-runs/")
+	return ok && strings.HasSuffix(suffix, "/log/download")
+}
+
+func logDownloadDeadline(apiBasePath string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if isStepLogDownload(r, apiBasePath) {
+			if isLogDownload(r, apiBasePath) {
 				if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
-					logger.Error(r.Context(), "Failed to clear step log download deadline", tag.Error(err))
+					logger.Error(r.Context(), "Failed to clear log download deadline", tag.Error(err))
 				}
 			}
 			next.ServeHTTP(w, r)
