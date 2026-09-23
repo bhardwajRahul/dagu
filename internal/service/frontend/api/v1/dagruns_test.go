@@ -1046,6 +1046,7 @@ func TestCompleteHumanTask(t *testing.T) {
 	completeResp.Unmarshal(t, &completeBody)
 	require.Equal(t, "review", completeBody.StepId)
 	require.True(t, completeBody.Queued)
+	require.True(t, completeBody.ResumeRequested)
 	require.Zero(t, completeBody.RemainingWaitingSteps)
 
 	queuedStatus := waitForStoredDAGRunStatus(t, server, "human_task_api_test", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
@@ -1069,6 +1070,68 @@ func TestCompleteHumanTask(t *testing.T) {
 	idempotentResp.Unmarshal(t, &completeBody)
 	require.True(t, completeBody.AlreadyCompleted)
 	require.False(t, completeBody.Queued)
+	require.False(t, completeBody.ResumeRequested)
+}
+
+// Approving the last dependency of a step that waits on a completed human task
+// queues the human-task resume, even while another task keeps waiting.
+func TestApproveQueuesUnblockedHumanTaskJoin(t *testing.T) {
+	server := test.SetupServer(t)
+
+	dagSpec := `type: graph
+steps:
+  - id: review
+    action: human.task
+    with:
+      prompt: "Review"
+  - id: gate
+    run: "exit 0"
+    approval:
+      prompt: "Approve"
+  - id: other
+    action: human.task
+    with:
+      prompt: "Other"
+  - id: join
+    depends: [review, gate]
+    run: "exit 0"`
+
+	server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+		Name: "human_task_approval_join",
+		Spec: &dagSpec,
+	}).ExpectStatus(http.StatusCreated).Send(t)
+
+	startResp := server.Client().Post("/api/v1/dags/human_task_approval_join/start", api.ExecuteDAGJSONRequestBody{}).
+		ExpectStatus(http.StatusOK).Send(t)
+	var startBody api.ExecuteDAG200JSONResponse
+	startResp.Unmarshal(t, &startBody)
+
+	waitForStoredDAGRunStatus(t, server, "human_task_approval_join", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.Status == ir.Waiting &&
+			hasNodeWithStatus(status, "review", ir.NodeWaiting) &&
+			hasNodeWithStatus(status, "gate", ir.NodeWaiting) &&
+			hasNodeWithStatus(status, "other", ir.NodeWaiting)
+	})
+
+	completeResp := server.Client().Post(
+		fmt.Sprintf("/api/v1/dag-runs/human_task_approval_join/%s/human-tasks/review/complete", startBody.DagRunId),
+		map[string]any{},
+	).ExpectStatus(http.StatusOK).Send(t)
+	var completeBody api.CompleteHumanTask200JSONResponse
+	completeResp.Unmarshal(t, &completeBody)
+	require.False(t, completeBody.ResumeRequested)
+
+	approveResp := server.Client().Post(
+		fmt.Sprintf("/api/v1/dag-runs/human_task_approval_join/%s/steps/gate/approve", startBody.DagRunId),
+		api.ApproveStepRequest{},
+	).ExpectStatus(http.StatusOK).Send(t)
+	var approveBody api.ApproveDAGRunStep200JSONResponse
+	approveResp.Unmarshal(t, &approveBody)
+	require.True(t, approveBody.Resumed)
+
+	waitForStoredDAGRunStatus(t, server, "human_task_approval_join", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.Status == ir.Queued && hasNodeWithStatus(status, "other", ir.NodeWaiting)
+	})
 }
 
 func TestManualStepActionsRejectWhileDAGRunIsRunning(t *testing.T) {

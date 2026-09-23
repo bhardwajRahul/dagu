@@ -30,8 +30,8 @@ func (s *Service) Resume(ctx context.Context, dagName, dagRunID string) (Result,
 		}
 		return resultFor(target.status, "", true), nil
 	}
-	if hasWaitingNodes(target.status.Nodes) {
-		return Result{}, errorf(ErrorConflict, "DAG-run %s still has manual steps waiting for input", target.ref)
+	if !resumeReady(target.status.Nodes) {
+		return Result{}, errorf(ErrorConflict, "DAG-run %s has no step ready to run while manual steps wait for input", target.ref)
 	}
 	if !hasCompletedHumanTask(target.status.Nodes) {
 		return Result{}, errorf(ErrorConflict, "DAG-run %s has no completed human-task checkpoint to resume", target.ref)
@@ -41,9 +41,10 @@ func (s *Service) Resume(ctx context.Context, dagName, dagRunID string) (Result,
 }
 
 func (s *Service) enqueueResume(ctx context.Context, target *target, result Result) (Result, error) {
-	if target.status == nil || target.status.Status != ir.Waiting || hasWaitingNodes(target.status.Nodes) {
+	if target.status == nil || target.status.Status != ir.Waiting || !resumeReady(target.status.Nodes) {
 		return result, nil
 	}
+	result.ResumeRequested = true
 	if s.QueueStore == nil {
 		return result, &ResumeError{Result: result, Err: errors.New("queue store is not configured")}
 	}
@@ -227,6 +228,83 @@ func countWaitingNodes(nodes []*ir.Node) int {
 	return count
 }
 
+// resumeReady reports whether a resumed attempt can make progress: either no
+// manual step is waiting, or a completed human task unblocked a step in a run
+// that has nothing for the resume to re-run.
+func resumeReady(nodes []*ir.Node) bool {
+	return !hasWaitingNodes(nodes) || (!hasRetryableNode(nodes) && hasUnblockedNode(nodes))
+}
+
+// hasRetryableNode reports whether a node has a status that every resume
+// re-runs (see runtime Plan.setupRetry). Such runs resume only once no manual
+// step is waiting, so those steps run again once rather than at each resume.
+func hasRetryableNode(nodes []*ir.Node) bool {
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		switch node.Status {
+		case ir.NodeFailed, ir.NodeRetrying, ir.NodeAborted, ir.NodeRejected:
+			return true
+		case ir.NodeNotStarted, ir.NodeRunning, ir.NodeSucceeded, ir.NodeSkipped,
+			ir.NodePartiallySucceeded, ir.NodeWaiting:
+		}
+	}
+	return false
+}
+
+// hasUnblockedNode reports whether a not-started step will run once resumed:
+// every dependency lets it proceed and at least one of them is a completed
+// human task. Steps with build inputs are excluded because their inferred
+// producer edges are not stored with the run.
+func hasUnblockedNode(nodes []*ir.Node) bool {
+	byName := make(map[string]*ir.Node, len(nodes))
+	for _, node := range nodes {
+		if node != nil {
+			byName[node.Step.Name] = node
+		}
+	}
+	for _, node := range nodes {
+		if node == nil || node.Status != ir.NodeNotStarted || len(node.Step.Inputs) > 0 {
+			continue
+		}
+		if dependenciesUnblocked(node.Step.Depends, byName) {
+			return true
+		}
+	}
+	return false
+}
+
+func dependenciesUnblocked(depends []string, byName map[string]*ir.Node) bool {
+	unblockedByTask := false
+	for _, name := range depends {
+		dep := byName[name]
+		if dep == nil || !dependencyAllowsRun(dep) {
+			return false
+		}
+		if dep.Step.HumanTask != nil && nodeCompleted(dep) {
+			unblockedByTask = true
+		}
+	}
+	return unblockedByTask
+}
+
+// dependencyAllowsRun mirrors the runtime readiness check (runtime isReady) for
+// states it can decide from stored status. A failed dependency never counts
+// because its continuation can depend on exit codes and logs.
+func dependencyAllowsRun(dep *ir.Node) bool {
+	switch dep.Status {
+	case ir.NodeSucceeded, ir.NodePartiallySucceeded:
+		return true
+	case ir.NodeSkipped:
+		return dep.SkippedByRetry || dep.Step.ContinueOn.Skipped
+	case ir.NodeNotStarted, ir.NodeRunning, ir.NodeFailed, ir.NodeAborted,
+		ir.NodeWaiting, ir.NodeRejected, ir.NodeRetrying:
+		return false
+	}
+	return false
+}
+
 func hasCompletedHumanTask(nodes []*ir.Node) bool {
 	for _, node := range nodes {
 		if node != nil && node.Step.HumanTask != nil && nodeCompleted(node) {
@@ -252,7 +330,7 @@ func HasCompletedTask(status *ir.DAGRunStatus) bool {
 
 // ResumePending reports whether a run is waiting for its human-task retry to be queued.
 func ResumePending(status *ir.DAGRunStatus) bool {
-	return status != nil && status.Status == ir.Waiting && !hasWaitingNodes(status.Nodes) && hasCompletedHumanTask(status.Nodes)
+	return status != nil && status.Status == ir.Waiting && resumeReady(status.Nodes) && hasCompletedHumanTask(status.Nodes)
 }
 
 // ValidateRetry rejects retry operations that would bypass human-task completion state.
@@ -271,7 +349,10 @@ func ValidateRetry(status *ir.DAGRunStatus, stepName string) error {
 			break
 		}
 	}
-	if status.Status == ir.Waiting && (hasWaitingHumanTask(status.Nodes) || ResumePending(status)) {
+	// Approval and agent-session flows retry runs that still have waiting
+	// steps, so only a checkpoint with no waiting step is reserved for resume.
+	if status.Status == ir.Waiting && (hasWaitingHumanTask(status.Nodes) ||
+		(!hasWaitingNodes(status.Nodes) && hasCompletedHumanTask(status.Nodes))) {
 		return errorf(ErrorConflict, "DAG-run %s is waiting on a human-task checkpoint; complete or resume it instead", status.DAGRun())
 	}
 	return nil

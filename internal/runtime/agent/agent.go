@@ -2365,6 +2365,11 @@ func (a *Agent) retryNodes() ([]*runtime.Node, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w: %s", runtime.ErrMissingNode, node.Step.Name)
 		}
+		// Carry the persisted human-task snapshot; the retry plan decides
+		// whether the task keeps it.
+		if step.HumanTask != nil && node.Step.HumanTask != nil {
+			step.HumanTask = node.Step.HumanTask
+		}
 		nodes = append(nodes, transform.ToNodeWithStep(node, step))
 	}
 	return nodes, nil
