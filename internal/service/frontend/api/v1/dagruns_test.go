@@ -1073,6 +1073,84 @@ func TestCompleteHumanTask(t *testing.T) {
 	require.False(t, completeBody.ResumeRequested)
 }
 
+// A push-back through the API validates feedback, honors the expected
+// iteration, resets the rewind target with the feedback, and queues the run.
+func TestPushBackHumanTask(t *testing.T) {
+	server := test.SetupServer(t)
+
+	dagSpec := `steps:
+  - id: implement
+    run: echo "implement ${feedback}"
+  - id: review
+    depends: implement
+    action: human.task
+    with:
+      prompt: "Review the change"
+      push_back:
+        rewind_to: implement
+        form:
+          type: object
+          properties:
+            feedback:
+              type: string
+          required: [feedback]
+  - id: publish
+    depends: review
+    run: echo publish`
+
+	server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+		Name: "human_task_push_back_api_test",
+		Spec: &dagSpec,
+	}).ExpectStatus(http.StatusCreated).Send(t)
+
+	startResp := server.Client().Post("/api/v1/dags/human_task_push_back_api_test/start", api.ExecuteDAGJSONRequestBody{}).
+		ExpectStatus(http.StatusOK).Send(t)
+	var startBody api.ExecuteDAG200JSONResponse
+	startResp.Unmarshal(t, &startBody)
+
+	waitForStoredDAGRunStatus(t, server, "human_task_push_back_api_test", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.Status == ir.Waiting && hasNodeWithStatus(status, "review", ir.NodeWaiting)
+	})
+
+	detailsResp := server.Client().Get(fmt.Sprintf(
+		"/api/v1/dag-runs/human_task_push_back_api_test/%s", startBody.DagRunId,
+	)).ExpectStatus(http.StatusOK).Send(t)
+	var details api.GetDAGRunDetails200JSONResponse
+	detailsResp.Unmarshal(t, &details)
+	require.Len(t, details.DagRunDetails.Nodes, 3)
+	review := details.DagRunDetails.Nodes[1]
+	require.Equal(t, "review", review.Step.Name)
+	require.NotNil(t, review.Step.HumanTask)
+	require.NotNil(t, review.Step.HumanTask.PushBack)
+	require.Equal(t, "implement", review.Step.HumanTask.PushBack.RewindTo)
+	require.NotNil(t, review.Step.HumanTask.PushBack.Form)
+	require.Equal(t, []any{"feedback"}, (*review.Step.HumanTask.PushBack.Form)["required"])
+
+	pushBackPath := fmt.Sprintf("/api/v1/dag-runs/human_task_push_back_api_test/%s/human-tasks/review/push-back", startBody.DagRunId)
+	server.Client().Post(pushBackPath, map[string]any{}).ExpectStatus(http.StatusBadRequest).Send(t)
+	server.Client().Post(pushBackPath+"?expectedIteration=1", map[string]any{"feedback": "add tests"}).
+		ExpectStatus(http.StatusConflict).Send(t)
+
+	pushBackResp := server.Client().Post(pushBackPath+"?expectedIteration=0", map[string]any{"feedback": "add tests"}).
+		ExpectStatus(http.StatusOK).Send(t)
+	var pushBackBody api.PushBackHumanTask200JSONResponse
+	pushBackResp.Unmarshal(t, &pushBackBody)
+	require.Equal(t, "review", pushBackBody.StepId)
+	require.Equal(t, "implement", pushBackBody.RewindTo)
+	require.Equal(t, 1, pushBackBody.Iteration)
+	require.True(t, pushBackBody.ResumeRequested)
+	require.True(t, pushBackBody.Queued)
+
+	queued := waitForStoredDAGRunStatus(t, server, "human_task_push_back_api_test", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.Status == ir.Queued && hasNodeWithStatus(status, "implement", ir.NodeNotStarted)
+	})
+	implement := requireNodeByName(t, queued, "implement")
+	require.Equal(t, 1, implement.ApprovalIteration)
+	require.Equal(t, map[string]string{"feedback": "add tests"}, implement.PushBackInputs)
+
+	server.Client().Post(pushBackPath, map[string]any{"feedback": "again"}).ExpectStatus(http.StatusConflict).Send(t)
+}
+
 // Approving the last dependency of a step that waits on a completed human task
 // queues the human-task resume, even while another task keeps waiting.
 func TestApproveQueuesUnblockedHumanTaskJoin(t *testing.T) {
@@ -1132,6 +1210,73 @@ steps:
 	waitForStoredDAGRunStatus(t, server, "human_task_approval_join", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
 		return status.Status == ir.Queued && hasNodeWithStatus(status, "other", ir.NodeWaiting)
 	})
+}
+
+// A push-back cannot resume while a failed step would re-run and another step
+// waits, so it stays stored. Approving the last waiting step must then queue
+// the resume like a human-task checkpoint instead of starting dagu retry.
+func TestApproveQueuesPendingHumanTaskPushBack(t *testing.T) {
+	server := test.SetupServer(t)
+
+	dagSpec := `type: graph
+steps:
+  - id: lint
+    run: "exit 1"
+    continue_on:
+      failure: true
+  - id: gate
+    run: "exit 0"
+    approval:
+      prompt: "Approve"
+  - id: implement
+    run: "exit 0"
+  - id: review
+    depends: implement
+    action: human.task
+    with:
+      prompt: "Review"
+      push_back:
+        rewind_to: implement`
+
+	server.Client().Post("/api/v1/dags", api.CreateNewDAGJSONRequestBody{
+		Name: "human_task_push_back_approval",
+		Spec: &dagSpec,
+	}).ExpectStatus(http.StatusCreated).Send(t)
+
+	startResp := server.Client().Post("/api/v1/dags/human_task_push_back_approval/start", api.ExecuteDAGJSONRequestBody{}).
+		ExpectStatus(http.StatusOK).Send(t)
+	var startBody api.ExecuteDAG200JSONResponse
+	startResp.Unmarshal(t, &startBody)
+
+	waitForStoredDAGRunStatus(t, server, "human_task_push_back_approval", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.Status == ir.Waiting &&
+			hasNodeWithStatus(status, "lint", ir.NodeFailed) &&
+			hasNodeWithStatus(status, "gate", ir.NodeWaiting) &&
+			hasNodeWithStatus(status, "review", ir.NodeWaiting)
+	})
+
+	pushBackResp := server.Client().Post(
+		fmt.Sprintf("/api/v1/dag-runs/human_task_push_back_approval/%s/human-tasks/review/push-back", startBody.DagRunId),
+		map[string]any{},
+	).ExpectStatus(http.StatusOK).Send(t)
+	var pushBackBody api.PushBackHumanTask200JSONResponse
+	pushBackResp.Unmarshal(t, &pushBackBody)
+	require.False(t, pushBackBody.ResumeRequested)
+
+	approveResp := server.Client().Post(
+		fmt.Sprintf("/api/v1/dag-runs/human_task_push_back_approval/%s/steps/gate/approve", startBody.DagRunId),
+		api.ApproveStepRequest{},
+	).ExpectStatus(http.StatusOK).Send(t)
+	var approveBody api.ApproveDAGRunStep200JSONResponse
+	approveResp.Unmarshal(t, &approveBody)
+	require.True(t, approveBody.Resumed)
+
+	queued := waitForStoredDAGRunStatus(t, server, "human_task_push_back_approval", startBody.DagRunId, 10*time.Second, func(status *ir.DAGRunStatus) bool {
+		return status.Status == ir.Queued
+	})
+	implement := requireNodeByName(t, queued, "implement")
+	require.Equal(t, ir.NodeNotStarted, implement.Status)
+	require.Equal(t, 1, implement.ApprovalIteration)
 }
 
 func TestManualStepActionsRejectWhileDAGRunIsRunning(t *testing.T) {

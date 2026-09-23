@@ -1343,7 +1343,9 @@ func (a *API) ApproveDAGRunStep(ctx context.Context, request api.ApproveDAGRunSt
 	shouldResume := !hasWaitingSteps(updated.Nodes) || humantask.ResumePending(updated)
 	if shouldResume {
 		var resumeErr error
-		if humantask.HasCompletedTask(updated) {
+		// Human-task checkpoints resume through the queue: dagu retry rejects a
+		// run while a human task waits.
+		if humantask.HasCompletedTask(updated) || humantask.PushBackPending(updated) {
 			_, resumeErr = a.humanTaskService().Resume(a.withEventContext(ctx), request.Name, request.DagRunId)
 		} else {
 			resumeErr = a.resumeDAGRun(ctx, ref, request.DagRunId)
@@ -4158,14 +4160,16 @@ func validateRequiredInputs(step ir.Step, body *api.ApproveStepRequest) error {
 }
 
 func validatePushBackInputs(step ir.Step, body *api.PushBackStepRequest) error {
-	if step.Approval == nil || len(step.Approval.Required) == 0 {
-		return nil
-	}
 	var provided map[string]string
 	if body != nil && body.Inputs != nil {
 		provided = *body.Inputs
 	}
-	return checkMissingInputs(step.Approval.Required, provided)
+	if step.Approval != nil && len(step.Approval.Required) > 0 {
+		if err := checkMissingInputs(step.Approval.Required, provided); err != nil {
+			return err
+		}
+	}
+	return dagrun.ValidatePushBackInputsSize(dagrun.FilterPushBackInputs(pushBackAllowedInputs(step), provided))
 }
 
 func applyPushBack(ctx context.Context, node *ir.Node, status *ir.DAGRunStatus, body *api.PushBackStepRequest) error {
@@ -4173,53 +4177,22 @@ func applyPushBack(ctx context.Context, node *ir.Node, status *ir.DAGRunStatus, 
 	if node.Step.Approval != nil && strings.TrimSpace(node.Step.Approval.RewindTo) != "" {
 		targetName = strings.TrimSpace(node.Step.Approval.RewindTo)
 	}
-	targetIdx := findStepByName(status.Nodes, targetName)
-	if targetIdx < 0 {
-		return fmt.Errorf("step %s approval.rewind_to references non-existent step %s", node.Step.Name, targetName)
-	}
-
-	nextIteration := node.ApprovalIteration + 1
 	var inputs map[string]string
 	if body != nil && body.Inputs != nil {
 		inputs = cloneStringMap(*body.Inputs)
 	}
-	allowedInputs := pushBackAllowedInputs(node.Step)
-	filteredInputs := dagrun.FilterPushBackInputs(allowedInputs, inputs)
-	history := buildPushBackHistory(ctx, node, allowedInputs, nextIteration, filteredInputs)
-
-	// Reset the configured rewind target and everything that depends on it.
-	rewoundNodes := append([]*ir.Node{status.Nodes[targetIdx]}, findDependentNodes(status.Nodes, targetName)...)
-	for _, rewoundNode := range rewoundNodes {
-		previousStdout := rewoundNode.Stdout
-		resetNodeForManualReexecution(rewoundNode)
-		setPushBackContext(rewoundNode, nextIteration, filteredInputs, history, previousStdout)
+	actor, actorID := manualActionSubject(ctx)
+	if _, err := dagrun.ApplyPushBack(status, node, dagrun.PushBack{
+		TargetName:    targetName,
+		AllowedInputs: pushBackAllowedInputs(node.Step),
+		Inputs:        inputs,
+		By:            actor,
+		ByID:          actorID,
+		At:            time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return fmt.Errorf("step %s approval.rewind_to: %w", node.Step.Name, err)
 	}
 	return nil
-}
-
-func buildPushBackHistory(ctx context.Context, node *ir.Node, allowedInputs []string, nextIteration int, inputs map[string]string) []ir.PushBackEntry {
-	history := dagrun.NormalizePushBackHistory(allowedInputs, node.ApprovalIteration, node.PushBackInputs, node.PushBackHistory)
-	actor, actorID := manualActionSubject(ctx)
-	history = append(history, ir.PushBackEntry{
-		Iteration: nextIteration,
-		By:        actor,
-		ByID:      actorID,
-		At:        time.Now().UTC().Format(time.RFC3339),
-		Inputs:    cloneStringMap(inputs),
-	})
-	return history
-}
-
-func resetNodeForManualReexecution(node *ir.Node) {
-	step := node.Step
-	*node = *ir.NewNodeFromStep(step)
-}
-
-func setPushBackContext(node *ir.Node, iteration int, inputs map[string]string, history []ir.PushBackEntry, previousStdout string) {
-	node.ApprovalIteration = iteration
-	node.PushBackInputs = cloneStringMap(inputs)
-	node.PushBackHistory = dagrun.ClonePushBackHistory(history)
-	node.PushBackPreviousStdout = previousStdout
 }
 
 func pushBackAllowedInputs(step ir.Step) []string {
@@ -4227,40 +4200,6 @@ func pushBackAllowedInputs(step ir.Step) []string {
 		return nil
 	}
 	return step.Approval.Input
-}
-
-// findDependentNodes returns all nodes that directly or transitively depend on the given step.
-func findDependentNodes(nodes []*ir.Node, stepName string) []*ir.Node {
-	// Build a set of step names that depend on the given step
-	dependentNames := make(map[string]bool)
-	dependentNames[stepName] = true
-
-	// Iterate until no new dependents are found (transitive closure)
-	changed := true
-	for changed {
-		changed = false
-		for _, n := range nodes {
-			if dependentNames[n.Step.Name] {
-				continue
-			}
-			for _, dep := range n.Step.Depends {
-				if dependentNames[dep] {
-					dependentNames[n.Step.Name] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-
-	// Collect dependent nodes (excluding the source step itself)
-	var result []*ir.Node
-	for _, n := range nodes {
-		if dependentNames[n.Step.Name] && n.Step.Name != stepName {
-			result = append(result, n)
-		}
-	}
-	return result
 }
 
 func (a *API) logStepPushBack(ctx context.Context, dagName, dagRunID, subDAGRunID, stepName string, iteration int, resumed bool) {
