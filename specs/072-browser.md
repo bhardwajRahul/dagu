@@ -94,8 +94,13 @@ declared under `secrets:` that has four or more characters. Values that only
 come from `env:` are not secrets and are not checked.
 
 Declared secret values and `ask` answers of four or more characters are masked
-in text sent to the model, in the step log, and in the timeline. Other variable
-values are not masked.
+in text sent to the model, including the page text, in the step log, and in
+the timeline. Other variable values are not masked.
+
+A model request carries the instruction or judged statement, the page's
+elements with their roles and visible text, and the extract schema or the
+names of the available variables. It never carries variable values, text the
+browser typed into fields, or screenshots.
 
 ### Outputs
 
@@ -209,7 +214,8 @@ or condition that sets zero or several keys fails validation. A step fails when
 an `act` does not complete, an `expect` does not hold, a selector does not
 appear before the timeout, a download does not finish, the page leaves the
 allowed domains, the browser stops responding, or the browser cannot be
-started.
+started. When an `act` fails because its model chose no element, the error
+names the model, since some models give that answer for every request.
 
 ## Examples
 
