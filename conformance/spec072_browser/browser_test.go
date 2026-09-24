@@ -16,9 +16,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/conformance/harness"
 	"github.com/stretchr/testify/require"
@@ -41,6 +43,10 @@ const rowsPage = `<!doctype html><html><head><title>Rows</title></head><body>
 </body></html>`
 
 const reportBody = "id,total\n1,10\n2,20\n"
+
+// browserCommandTimeout bounds a command that starts a browser. Starting
+// one takes tens of seconds when the conformance job loads the runner.
+const browserCommandTimeout = 2 * time.Minute
 
 // Model request kinds, told apart by the response schema the browser
 // runtime asks for.
@@ -230,14 +236,16 @@ func newBrowserEnv(t *testing.T) *browserEnv {
 	t.Helper()
 	requireChrome(t)
 	model, modelURL := startModel(t)
-	env := []string{"SHOP_URL=" + startShop(t), "LLM_BASE_URL=" + modelURL}
+	// The harness sets CI, where the browser runtime turns off the sandbox,
+	// so the tests turn it off explicitly instead of being refused.
+	env := []string{"SHOP_URL=" + startShop(t), "LLM_BASE_URL=" + modelURL, "DAGU_BROWSER_SANDBOX=false"}
 	if runtime.GOOS == "windows" {
 		// The harness points the profile folders at empty temporary paths;
 		// Chrome on Windows needs the real ones to start.
 		env = append(env, "USERPROFILE="+os.Getenv("USERPROFILE"), "APPDATA="+os.Getenv("APPDATA"))
 	}
 	return &browserEnv{
-		dagu:  harness.NewRunner(t),
+		dagu:  harness.NewRunner(t).WithCommandTimeout(browserCommandTimeout),
 		model: model,
 		env:   env,
 	}
@@ -272,6 +280,21 @@ func TestBrowserDialogs(t *testing.T) {
 	b := newBrowserEnv(t)
 	b.dagu.RunWithEnv(b.env, "start", "dialogs.yaml").ExpectExitCode(0)
 	require.Equal(t, 1, b.model.count(kindAct))
+}
+
+// With the sandbox on, a browser step fails before starting a browser where
+// the browser runtime would turn the sandbox off, here because CI is set.
+func TestBrowserSandboxNotSilentlyOff(t *testing.T) {
+	t.Parallel()
+
+	b := newBrowserEnv(t)
+	env := slices.DeleteFunc(slices.Clone(b.env), func(entry string) bool {
+		return strings.HasPrefix(entry, "DAGU_BROWSER_SANDBOX=")
+	})
+	result := b.dagu.RunWithEnv(env, "start", "extract.yaml")
+	result.ExpectNonZeroExitCode()
+	result.ExpectStderrContains("because CI is set", "DAGU_BROWSER_SANDBOX=false")
+	require.Zero(t, b.model.total())
 }
 
 func TestBrowserExtract(t *testing.T) {

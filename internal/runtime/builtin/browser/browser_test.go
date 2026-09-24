@@ -36,6 +36,8 @@ type testRun struct {
 	launcher  *fakeLauncher
 	provider  *scriptedProvider
 	secrets   map[string]string
+	// noSandbox is the host's setting that turns off the browser sandbox.
+	noSandbox bool
 }
 
 func newTestRun(t *testing.T, answer func(*llmpkg.ChatRequest) (string, error)) *testRun {
@@ -89,7 +91,10 @@ func (r *testRun) context() context.Context {
 	for name, secret := range r.secrets {
 		scope = scope.WithEntry(name, secret, value.EnvSourceSecret)
 	}
-	ctx := cmnconfig.WithConfig(r.t.Context(), &cmnconfig.Config{Paths: cmnconfig.PathsConfig{DataDir: r.dataDir}})
+	ctx := cmnconfig.WithConfig(r.t.Context(), &cmnconfig.Config{
+		Paths:   cmnconfig.PathsConfig{DataDir: r.dataDir},
+		Browser: cmnconfig.BrowserConfig{NoSandbox: r.noSandbox},
+	})
 	return runtime.WithEnv(ctx, runtime.Env{
 		Context: runtime.Context{
 			DAG:      &ir.DAG{Name: "orders"},
@@ -215,6 +220,20 @@ func TestAcceptedDialogsAreReported(t *testing.T) {
 	session := execution.exec.GetAgentSession()
 	assert.Equal(t, []string{"act:completed", "dialog:completed", "screenshot:completed"}, eventNames(session))
 	assert.Contains(t, execution.stderr.String(), `[1/2] dialog "Send *******?" → accepted confirm`)
+}
+
+// The browser sandbox stays on unless the host configuration turns it off.
+func TestHostSandboxSetting(t *testing.T) {
+	t.Parallel()
+
+	for _, noSandbox := range []bool{false, true} {
+		run := newTestRun(t, pageModel(nil))
+		run.noSandbox = noSandbox
+		require.NoError(t, run.execute(`{"do": [{"act": "Click the checkout button"}]}`, nil).err)
+
+		require.Len(t, run.launcher.launches, 1)
+		assert.Equal(t, noSandbox, run.launcher.launches[0].NoSandbox)
+	}
 }
 
 func TestSecretInInstructionIsRejected(t *testing.T) {

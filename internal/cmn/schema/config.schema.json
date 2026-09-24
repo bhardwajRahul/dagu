@@ -194,6 +194,9 @@
     "opencode": {
       "$ref": "#/definitions/OpenCodeDef"
     },
+    "browser": {
+      "$ref": "#/definitions/BrowserDef"
+    },
     "proc": {
       "$ref": "#/definitions/ProcDef"
     },
@@ -1122,6 +1125,18 @@
           "items": {
             "type": "string"
           }
+        }
+      }
+    },
+    "BrowserDef": {
+      "type": "object",
+      "description": "Browsers that browser steps start on this host.",
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "type": "boolean",
+          "description": "Keep Chromium's sandbox on for every browser started on this host. Set to false only where the sandbox cannot start; pages are then isolated from the host only by the operating system user.",
+          "default": true
         }
       }
     },

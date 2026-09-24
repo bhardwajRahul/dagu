@@ -36,8 +36,9 @@ behaves as `browser.run` with one `extract` operation.
 Each operation sets exactly one of:
 
 - `goto`: navigate to a URL.
-- `act`: perform an action described in natural language. The value is an
-  instruction string or an object with `instruction` and optional `cache`.
+- `act`: perform one action described in natural language, such as a click
+  or typing into one field. The value is an instruction string or an object
+  with `instruction` and optional `cache`.
 - `extract`: `{instruction, schema}`. The schema must be a JSON Schema with
   `type: object`.
 - `expect`: a condition that must hold; otherwise the step fails with the
@@ -110,6 +111,13 @@ those outputs. Operation progress is written to stderr.
 `with.browser` accepts `headless` (default `true`), `executable` (otherwise
 `CHROME_PATH` or an installed Chrome), `viewport` `{width, height}`, `proxy`
 (unauthenticated), `allowed_domains`, `screenshots`, and `profile`.
+
+The host configuration `browser.sandbox: false`, or the environment variable
+`DAGU_BROWSER_SANDBOX=false`, turns off Chromium's sandbox for every browser
+the host starts, for hosts where the sandbox cannot start. The sandbox is on
+by default, and a DAG cannot change it. With the sandbox on, a step fails
+before starting a browser where the browser runtime would turn the sandbox off
+anyway: when `CI` is set, or when Dagu runs as root on Linux.
 
 ### Allowed domains
 
@@ -226,7 +234,8 @@ steps:
       variables:
         coupon: ${SHOP_COUPON}
       do:
-        - act: Enter %coupon% in the coupon field and apply it
+        - act: Type %coupon% into the coupon field
+        - act: Click the Apply button
         - act: Click the Place order button
         - expect: {text: Order confirmed}
         - extract:
