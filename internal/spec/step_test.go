@@ -82,7 +82,11 @@ func TestMain(m *testing.M) {
 	// state: supports operation commands only
 	registry.RegisterExecutorCapabilities("state", registry.ExecutorCapabilities{Command: true})
 	// chat: LLM executor
-	registry.RegisterExecutorCapabilities("chat", registry.ExecutorCapabilities{LLM: true})
+	registry.RegisterExecutorCapabilities("chat", registry.ExecutorCapabilities{LLM: true, Messages: true})
+	// llm_tool: uses an llm config without chat messages
+	registry.RegisterExecutorCapabilities("llm_tool", registry.ExecutorCapabilities{LLM: true})
+	// browser: uses an llm config without chat messages
+	registry.RegisterExecutorCapabilities(ir.ExecutorTypeBrowser, registry.ExecutorCapabilities{LLM: true})
 
 	os.Exit(m.Run())
 }
@@ -3524,6 +3528,13 @@ func TestValidateLLM(t *testing.T) {
 			wantErr: true,
 			errMsg:  "at least one message is required",
 		},
+		{
+			name: "NoMessagesForExecutorWithoutMessages",
+			step: &ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{Type: "llm_tool"},
+				LLM:            &ir.LLMConfig{Provider: "openai", Model: "gpt-4"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -3565,6 +3576,14 @@ func TestValidateMessages(t *testing.T) {
 			name: "MessagesWithUnsupportedExecutor",
 			step: &ir.Step{
 				ExecutorConfig: ir.ExecutorConfig{Type: "shell"},
+				Messages:       []ir.PromptMessage{{Role: "user", Content: "hello"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "MessagesWithLLMExecutorWithoutMessages",
+			step: &ir.Step{
+				ExecutorConfig: ir.ExecutorConfig{Type: "llm_tool"},
 				Messages:       []ir.PromptMessage{{Role: "user", Content: "hello"}},
 			},
 			wantErr: true,
