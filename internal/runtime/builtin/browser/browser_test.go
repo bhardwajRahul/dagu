@@ -236,6 +236,19 @@ func TestHostSandboxSetting(t *testing.T) {
 	}
 }
 
+// When the model answers that no element matches, the error says so and names
+// the model, because some models give that answer for every request.
+func TestActWithNoMatchingElementNamesTheModel(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, func(*llmpkg.ChatRequest) (string, error) { return `{}`, nil })
+	execution := run.execute(`{"do": [{"act": "Click the checkout button"}]}`, nil)
+
+	require.ErrorContains(t, execution.err,
+		"do[0] act failed: the model (test-model) answered that no element on the page matches the instruction")
+	require.ErrorContains(t, execution.err, "try another model")
+}
+
 func TestSecretInInstructionIsRejected(t *testing.T) {
 	t.Parallel()
 

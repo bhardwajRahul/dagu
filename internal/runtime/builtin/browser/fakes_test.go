@@ -128,7 +128,8 @@ func (e *fakeEngine) Act(ctx context.Context, instruction string, variables map[
 		ElementID string `json:"elementId"`
 	}
 	if err := json.Unmarshal(resp.JSON, &choice); err != nil || choice.ElementID == "" {
-		return actOutcome{Message: "no element matched"}, nil
+		// The browser runtime reports a model that chose no element this way.
+		return actOutcome{Message: "Failed to perform act: No action found"}, nil
 	}
 	return actOutcome{
 		Success: true,

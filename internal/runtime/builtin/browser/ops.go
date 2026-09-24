@@ -37,6 +37,10 @@ const (
 	failureShotLabel      = "failure"
 )
 
+// noActionFoundMessage is how the browser runtime reports an act whose model
+// chose no element.
+const noActionFoundMessage = "No action found"
+
 // statementSchema is the extract schema used to judge when and expect
 // statements.
 var statementSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["answer","reason"],"properties":{"answer":{"type":"boolean","description":"Whether the statement is true for the current page"},"reason":{"type":"string","description":"One sentence explaining the answer"}}}`)
@@ -437,6 +441,11 @@ func (r *run) act(ctx context.Context, index int, spec actSpec, timeout time.Dur
 		return err
 	}
 	if !outcome.Success {
+		if strings.Contains(outcome.Message, noActionFoundMessage) {
+			return fmt.Errorf("the model (%s) answered that no element on the page matches the instruction; "+
+				"if the element is on the page, reword the instruction or try another model, "+
+				"since some models give this answer for every request", r.bridge.modelName())
+		}
 		return fmt.Errorf("act did not complete: %s", outcome.Message)
 	}
 	if useCache && len(outcome.Actions) > 0 {
