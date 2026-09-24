@@ -157,7 +157,7 @@ func runHumanTaskCompleteWith(ctx *Context, args []string, deps humanTaskComplet
 	stepID := command.stepID
 
 	service := newLocalHumanTaskService(ctx, deps)
-	completedBy, completedByID := localHumanTaskSubject(deps)
+	completedBy, completedByID := localOSSubject(deps.currentUser)
 	result, err := service.Complete(ctx, humantask.CompleteRequest{
 		DAGName:       command.dagName,
 		DAGRunID:      command.dagRunID,
@@ -211,7 +211,7 @@ func runHumanTaskPushBackWith(ctx *Context, args []string, deps humanTaskComplet
 	}
 
 	service := newLocalHumanTaskService(ctx, deps)
-	by, byID := localHumanTaskSubject(deps)
+	by, byID := localOSSubject(deps.currentUser)
 	result, err := service.PushBack(ctx, humantask.PushBackRequest{
 		DAGName:           command.dagName,
 		DAGRunID:          command.dagRunID,
@@ -262,21 +262,6 @@ func parseHumanTaskExpectedIteration(command *cobra.Command) (*int, error) {
 		return nil, fmt.Errorf("--%s must be a non-negative integer", humanTaskFlagExpectedIteration)
 	}
 	return &iteration, nil
-}
-
-func localHumanTaskSubject(deps humanTaskCompleteDeps) (name, id string) {
-	if deps.currentUser == nil {
-		return "", ""
-	}
-	current, err := deps.currentUser()
-	if err != nil || current == nil {
-		return "", ""
-	}
-	name = strings.TrimSpace(current.Username)
-	if uid := strings.TrimSpace(current.Uid); uid != "" {
-		id = "os:" + uid
-	}
-	return name, id
 }
 
 func parseHumanTaskCompletionInput(command *cobra.Command) (humantask.Input, error) {

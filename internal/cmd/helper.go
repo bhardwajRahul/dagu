@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
@@ -178,4 +179,21 @@ func extractDAGName(ctx *Context, name string) (string, error) {
 	}
 
 	return dag.Name, nil
+}
+
+// localOSSubject returns the local OS account running the command as an actor
+// name and an "os:<uid>" ID. Both are empty when the account is unknown.
+func localOSSubject(currentUser func() (*user.User, error)) (name, id string) {
+	if currentUser == nil {
+		return "", ""
+	}
+	current, err := currentUser()
+	if err != nil || current == nil {
+		return "", ""
+	}
+	name = strings.TrimSpace(current.Username)
+	if uid := strings.TrimSpace(current.Uid); uid != "" {
+		id = "os:" + uid
+	}
+	return name, id
 }
