@@ -211,6 +211,10 @@ func remoteRunStart(ctx *Context, args []string) error {
 	if err := validateRemoteStartLikeFlags(ctx); err != nil {
 		return err
 	}
+	selection, err := selectedStepsParams(ctx)
+	if err != nil {
+		return err
+	}
 	fromRunID, err := ctx.StringParam("from-run-id")
 	if err != nil {
 		return err
@@ -267,12 +271,18 @@ func remoteRunStart(ctx *Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	var steps *[]string
+	if len(selection.steps) > 0 {
+		steps = &selection.steps
+	}
 	resp, err := ctx.Remote.startDAG(ctx, dag.FileName, api.ExecuteDAGJSONBody{
-		DagName:  stringPtrOrNil(nameOverride),
-		DagRunId: stringPtrOrNil(runID),
-		Params:   stringPtrOrNil(params),
-		Labels:   labels,
-		NoReuse:  &noReuse,
+		DagName:          stringPtrOrNil(nameOverride),
+		DagRunId:         stringPtrOrNil(runID),
+		Params:           stringPtrOrNil(params),
+		Labels:           labels,
+		NoReuse:          &noReuse,
+		Steps:            steps,
+		OutputsFromRunId: stringPtrOrNil(selection.outputsFrom),
 	})
 	if err != nil {
 		return err
